@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy static website from S3 zip object using Lambda custom resource'
+
+Parameters:
+  SourceBucket:
+    Type: 'String'
+    Description: 'Source S3 bucket containing the zip file'
+    Default: 'bucketname'
+  SourceKey:
+    Type: 'String'
+    Description: 'S3 key of the zip file to download'
+    Default: 'sample-website.zip'
+  WebsiteBucketName:
+    Type: 'String'
+    Description: 'Name for the website S3 bucket'
+
+Resources:
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'S3Access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::${SourceBucket}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource: !Sub 'arn:aws:s3:::${WebsiteBucket}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:ListBucket'
+                Resource: !GetAtt WebsiteBucket.Arn
+
+  DeploymentFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-deploy-website'
+      Runtime: 'python3.9'
+      Handler: 'index.handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: '300'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import zipfile
+          import io
+          import cfnresponse
+          import mimetypes
+          
+          s3 = boto3.client('s3')
+          
+          def handler(event, context):
+              print(f"Event received: {json.dumps(event, indent=2)}")
+              
+              try:
+                  request_type = event['RequestType']
+                  props = event['ResourceProperties']
+                  source_bucket = props['SourceBucket']
+                  source_key = props['SourceKey']
+                  target_bucket = props['TargetBucket']
+                  
+                  print(f"Processing {request_type} request")
+                  print(f"Source: s3://{source_bucket}/{source_key}")
+                  print(f"Target: s3://{target_bucket}")
+                  
+                  deployed_files = []
+                  
+                  if request_type == 'Create' or request_type == 'Update':
+                      print("Downloading zip file...")
+                      response = s3.get_object(Bucket=source_bucket, Key=source_key)
+                      zip_content = response['Body'].read()
+                      print(f"Downloaded {len(zip_content)} bytes")
+                      
+                      print("Extracting and uploading files...")
+                      with zipfile.ZipFile(io.BytesIO(zip_content)) as zip_file:
+                          for file_info in zip_file.filelist:
+                              if not file_info.is_dir():
+                                  file_content = zip_file.read(file_info.filename)
+                                  content_type = mimetypes.guess_type(file_info.filename)[0] or 'binary/octet-stream'
+                                  
+                                  s3.put_object(
+                                      Bucket=target_bucket,
+                                      Key=file_info.filename,
+                                      Body=file_content,
+                                      ContentType=content_type
+                                  )
+                                  deployed_files.append(file_info.filename)
+                                  print(f"Uploaded: {file_info.filename} ({content_type})")
+                      
+                      response_data = {
+                          'DeployedFiles': ','.join(deployed_files),
+                          'FileCount': str(len(deployed_files)),
+                          'SourceLocation': f's3://{source_bucket}/{source_key}',
+                          'TargetBucket': target_bucket
+                      }
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                      
+                  elif request_type == 'Delete':
+                      print("Cleaning up target bucket...")
+                      deleted_objects = []
+                      paginator = s3.get_paginator('list_objects_v2')
+                      for page in paginator.paginate(Bucket=target_bucket):
+                          if 'Contents' in page:
+                              objects = [{'Key': obj['Key']} for obj in page['Contents']]
+                              s3.delete_objects(Bucket=target_bucket, Delete={'Objects': objects})
+                              deleted_objects.extend([obj['Key'] for obj in objects])
+                      
+                      response_data = {
+                          'DeletedFiles': ','.join(deleted_objects),
+                          'DeletedCount': str(len(deleted_objects))
+                      }
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                      
+              except Exception as e:
+                  error_msg = f"Error: {str(e)}"
+                  print(error_msg)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': error_msg})
+
+  WebsiteBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref WebsiteBucketName
+      WebsiteConfiguration:
+        IndexDocument: 'index.html'
+        ErrorDocument: 'error.html'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: 'false'
+        BlockPublicPolicy: 'false'
+        IgnorePublicAcls: 'false'
+        RestrictPublicBuckets: 'false'
+
+  WebsiteBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: 'Allow'
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${WebsiteBucket}/*'
+
+  WebsiteDeployment:
+    Type: 'AWS::CloudFormation::CustomResource'
+    Properties:
+      ServiceToken: !GetAtt DeploymentFunction.Arn
+      SourceBucket: !Ref SourceBucket
+      SourceKey: !Ref SourceKey
+      TargetBucket: !Ref WebsiteBucket
+
+Outputs:
+  WebsiteURL:
+    Description: 'URL of the static website'
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+  BucketName:
+    Description: 'Name of the website bucket'
+    Value: !Ref WebsiteBucket
+  DeployedFiles:
+    Description: 'List of deployed files'
+    Value: !GetAtt WebsiteDeployment.DeployedFiles
+  FileCount:
+    Description: 'Number of deployed files'
+    Value: !GetAtt WebsiteDeployment.FileCount
+  SourceLocation:
+    Description: 'Source location of the zip file'
+    Value: !GetAtt WebsiteDeployment.SourceLocation

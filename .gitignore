@@ -1,0 +1,36 @@
+# AWS CloudFormation
+*.json
+parameters.json
+packaged-template.yaml
+
+# AWS CLI
+.aws/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+
+# Test files
+test-*
+sample-*
+
+# Environment files
+.env
+.env.local
