@@ -50,7 +50,7 @@ Resources:
     Type: 'AWS::Lambda::Function'
     Properties:
       FunctionName: !Sub '${AWS::StackName}-deploy-website'
-      Runtime: 'python3.9'
+      Runtime: 'python3.13'
       Handler: 'index.handler'
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: '300'
